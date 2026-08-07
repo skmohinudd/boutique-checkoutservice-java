@@ -1,35 +1,35 @@
 spring:
   application:
     name: checkoutservice
-
 server:
   port: ${SERVER_PORT:8086}
   shutdown: graceful
-
+  tomcat:
+    threads:
+      max: ${SERVER_TOMCAT_MAX_THREADS:64}
+      min-spare: ${SERVER_TOMCAT_MIN_SPARE_THREADS:10}
+    accept-count: ${SERVER_TOMCAT_ACCEPT_COUNT:200}
+    max-connections: ${SERVER_TOMCAT_MAX_CONNECTIONS:2000}
 clients:
   cart:
-    base-url:
-      ${CART_SERVICE_URL:http://localhost:8083}
-
+    base-url: ${CART_SERVICE_URL:http://localhost:8083}
   order:
-    base-url:
-      ${ORDER_SERVICE_URL:http://localhost:8084}
-
+    base-url: ${ORDER_SERVICE_URL:http://localhost:8084}
   payment:
-    base-url:
-      ${PAYMENT_SERVICE_URL:http://localhost:8085}
-
+    base-url: ${PAYMENT_SERVICE_URL:http://localhost:8085}
+  inventory:
+    base-url: ${INVENTORY_SERVICE_URL:http://localhost:8081}
 management:
   endpoints:
     web:
       exposure:
         include: health,info,prometheus
-
   endpoint:
     health:
       probes:
         enabled: true
-
 springdoc:
+  api-docs:
+    enabled: ${OPENAPI_ENABLED:false}
   swagger-ui:
-    path: /swagger-ui.html
+    enabled: ${SWAGGER_ENABLED:false}
