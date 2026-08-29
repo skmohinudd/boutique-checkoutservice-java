@@ -1,0 +1,860 @@
+name: Checkout Service CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: checkoutservice-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Application/service identity
+  SERVICE_NAME: checkoutservice
+
+  # AWS configuration
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "663130434910"
+  ECR_REPOSITORY: boutique-checkoutservice-java
+  EKS_CLUSTER_NAME: boutique-dev-eks
+
+  # Kubernetes configuration
+  K8S_NAMESPACE: boutique
+  K8S_DEPLOYMENT: checkoutservice
+  K8S_SERVICE: checkoutservice
+  SERVICE_PORT: "8086"
+
+  # Helm configuration
+  HELM_RELEASE: checkoutservice-dev
+  PLATFORM_REPOSITORY: skmohinudd/boutique-platform-infra
+  HELM_CHART_PATH: boutique-platform-infra/helm/checkoutservice
+
+  # SonarQube configuration
+  SONAR_HOST_URL: http://44.199.205.21:9000
+  SONAR_PROJECT_KEY: boutique-checkoutservice
+  SONAR_PROJECT_NAME: Boutique Checkout Service
+
+
+jobs:
+
+  # ==========================================================
+  # JOB 1 - PULL REQUEST VALIDATION
+  # ==========================================================
+  # Runs only when a pull request targets main.
+  #
+  # Purpose:
+  # - Compile/test the code
+  # - Run SonarQube analysis
+  # - Do NOT deploy anything
+  # ==========================================================
+
+  pr-validation:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+
+      # ------------------------------------------------------
+      # Download Checkout Service repository to the runner.
+      # fetch-depth: 0 provides complete Git history, which is
+      # useful for SonarQube source/history analysis.
+      # ------------------------------------------------------
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ------------------------------------------------------
+      # Install Java 21 and enable Maven dependency caching.
+      # ------------------------------------------------------
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+
+      # ------------------------------------------------------
+      # Fix Windows line endings and make mvnw executable.
+      # GitHub runner is Linux.
+      # ------------------------------------------------------
+
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+
+      # ------------------------------------------------------
+      # Run application tests.
+      #
+      # Maven uses our Nexus settings so dependencies can be
+      # downloaded through the configured Nexus repository.
+      # ------------------------------------------------------
+
+      - name: Run tests
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean test \
+            > /tmp/tests.log 2>&1
+          then
+            echo "Checkout Service tests passed"
+          else
+            echo "Checkout Service tests failed"
+            tail -n 80 /tmp/tests.log
+            exit 1
+          fi
+
+
+      # ------------------------------------------------------
+      # Analyze Checkout Service code in SonarQube.
+      #
+      # SONAR_TOKEN authenticates GitHub Actions to SonarQube.
+      # ------------------------------------------------------
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+
+
+
+  # ==========================================================
+  # JOB 2 - BUILD AND DEPLOY MAIN
+  # ==========================================================
+  # Runs only for:
+  #
+  # 1. Push to main
+  # 2. Manual workflow_dispatch
+  #
+  # Flow:
+  # Build -> Sonar -> Nexus -> AWS -> ECR -> Helm -> EKS
+  # ==========================================================
+
+  deploy-main:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ------------------------------------------------------
+      # Download Checkout Service repository.
+      # ------------------------------------------------------
+
+      - name: Checkout Checkout Service
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ------------------------------------------------------
+      # Install Java 21.
+      # ------------------------------------------------------
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+
+      # ------------------------------------------------------
+      # Prepare Maven Wrapper for Linux runner.
+      # ------------------------------------------------------
+
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+
+      # ======================================================
+      # APPLICATION VERSION
+      # ======================================================
+      # Example:
+      #
+      # GitHub run number 10, attempt 1
+      # APP_VERSION=1.0.10.1
+      #
+      # The same version is used for:
+      # Maven JAR -> Nexus -> Docker -> ECR -> Helm -> EKS
+      # ======================================================
+
+      - name: Generate application version
+        run: |
+          APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "JAR_NAME=checkoutservice-$APP_VERSION.jar" >> "$GITHUB_ENV"
+
+          echo "Checkout Service version: $APP_VERSION"
+
+
+      # ======================================================
+      # VALIDATE REQUIRED GITHUB SECRETS
+      # ======================================================
+
+      - name: Validate required secrets
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          AWS_GITHUB_ROLE_ARN: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+
+        run: |
+          for NAME in \
+            SONAR_TOKEN \
+            NEXUS_USERNAME \
+            NEXUS_PASSWORD \
+            AWS_GITHUB_ROLE_ARN
+          do
+            if [ -z "${!NAME}" ]; then
+              echo "Missing required GitHub secret: $NAME"
+              exit 1
+            fi
+          done
+
+          echo "Required GitHub secrets verified"
+
+
+      # ======================================================
+      # SET MAVEN VERSION
+      # ======================================================
+
+      - name: Set Maven version
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            versions:set \
+            -DnewVersion="$APP_VERSION" \
+            -DgenerateBackupPoms=false \
+            > /tmp/version.log 2>&1
+          then
+            echo "Maven version updated to $APP_VERSION"
+          else
+            echo "Failed to update Maven version"
+            tail -n 60 /tmp/version.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # TEST AND BUILD APPLICATION JAR
+      # ======================================================
+
+      - name: Test and build JAR
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean package \
+            > /tmp/build.log 2>&1
+          then
+            test -f "target/$JAR_NAME"
+            echo "Checkout Service build completed: $JAR_NAME"
+          else
+            echo "Checkout Service build failed"
+            tail -n 100 /tmp/build.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # SONARQUBE CODE QUALITY ANALYSIS
+      # ======================================================
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.projectVersion="$APP_VERSION" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # PUBLISH JAR TO NEXUS
+      # ======================================================
+
+      - name: Publish JAR to Nexus
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            deploy \
+            -DskipTests \
+            > /tmp/nexus.log 2>&1
+          then
+            echo "Nexus artifact published: $JAR_NAME"
+          else
+            echo "Nexus publication failed"
+            tail -n 80 /tmp/nexus.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # AUTHENTICATE GITHUB ACTIONS TO AWS USING OIDC
+      # ======================================================
+      # No permanent AWS access keys are used.
+      #
+      # GitHub obtains an OIDC token and AWS STS provides
+      # temporary credentials for our IAM role.
+      # ======================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: checkoutservice-${{ github.run_id }}
+          allowed-account-ids: "663130434910"
+
+
+      # ======================================================
+      # VERIFY AWS ACCOUNT AND ECR REPOSITORY
+      # ======================================================
+
+      - name: Validate AWS and ECR
+        run: |
+          ACCOUNT="$(aws sts get-caller-identity \
+            --query Account \
+            --output text)"
+
+          if [ "$ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+            echo "Wrong AWS account"
+            echo "Expected: $AWS_ACCOUNT_ID"
+            echo "Actual  : $ACCOUNT"
+            exit 1
+          fi
+
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            > /dev/null
+
+          echo "AWS account and Checkout ECR repository verified"
+
+
+      # ======================================================
+      # LOGIN TO AMAZON ECR
+      # ======================================================
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ======================================================
+      # BUILD CHECKOUT SERVICE DOCKER IMAGE
+      # ======================================================
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+
+        run: |
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_URI="${IMAGE_REPOSITORY}:${APP_VERSION}"
+
+          echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          if docker build \
+            --quiet \
+            --label "org.opencontainers.image.version=$APP_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE_URI" \
+            . \
+            > /tmp/docker-build.log 2>&1
+          then
+            echo "Docker image built: $IMAGE_URI"
+          else
+            echo "Docker build failed"
+            tail -n 100 /tmp/docker-build.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # TRIVY
+      # ======================================================
+      # Security scanning will be enabled after the existing
+      # Trivy scan/cache issue is resolved.
+      # ======================================================
+
+      # Trivy intentionally disabled for now.
+
+
+      # ======================================================
+      # PUSH DOCKER IMAGE TO ECR
+      # ======================================================
+
+      - name: Push image to ECR
+        run: |
+          if docker push \
+            --quiet \
+            "$IMAGE_URI" \
+            > /tmp/ecr-push.log 2>&1
+          then
+            echo "Checkout image pushed: $IMAGE_URI"
+          else
+            echo "ECR push failed"
+            tail -n 80 /tmp/ecr-push.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # VERIFY IMAGE EXISTS IN ECR
+      # ======================================================
+
+      - name: Validate ECR image
+        run: |
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$APP_VERSION" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          test -n "$IMAGE_DIGEST"
+          test "$IMAGE_DIGEST" != "None"
+
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+
+          echo "ECR image verified"
+          echo "Digest: $IMAGE_DIGEST"
+
+
+      # ======================================================
+      # INSTALL KUBECTL AND HELM ON GITHUB RUNNER
+      # ======================================================
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v5.1.0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5.0.0
+
+
+      # ======================================================
+      # CHECKOUT CENTRAL PLATFORM/HELM REPOSITORY
+      # ======================================================
+      # Checkout Service Helm chart lives in:
+      #
+      # boutique-platform-infra/helm/checkoutservice
+      # ======================================================
+
+      - name: Checkout platform repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPOSITORY }}
+          path: boutique-platform-infra
+          persist-credentials: false
+
+
+      # ======================================================
+      # VALIDATE CHECKOUT HELM CHART
+      # ======================================================
+      # helm lint:
+      # Checks Helm chart syntax.
+      #
+      # helm template:
+      # Renders Kubernetes YAML without deploying anything.
+      # ======================================================
+
+      - name: Validate Helm chart
+        run: |
+          test -f "$HELM_CHART_PATH/Chart.yaml"
+          test -f "$HELM_CHART_PATH/values.yaml"
+
+          helm lint "$HELM_CHART_PATH"
+
+          helm template "$HELM_RELEASE" "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            > /tmp/checkoutservice-rendered.yaml
+
+          test -s /tmp/checkoutservice-rendered.yaml
+
+          echo "Checkout Service Helm chart validated"
+
+
+      # ======================================================
+      # CONNECT GITHUB RUNNER TO EKS
+      # ======================================================
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME" \
+            > /dev/null
+
+          test "$(kubectl auth can-i get deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+          test "$(kubectl auth can-i patch deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+          echo "EKS access verified"
+
+
+      # ======================================================
+      # CHECK CHECKOUT SERVICE DEPENDENCIES
+      # ======================================================
+      # Checkout does not directly use PostgreSQL/Kafka/
+      # RabbitMQ in its current application configuration.
+      #
+      # Checkout calls these Kubernetes services:
+      #
+      # cartservice      :8083
+      # orderservice     :8084
+      # paymentservice   :8085
+      # inventoryservice :8081
+      #
+      # Deployment should stop early if one is missing.
+      # ======================================================
+
+      - name: Validate Checkout Service dependencies
+        run: |
+          FAILED=0
+
+          for SERVICE in \
+            cartservice \
+            orderservice \
+            paymentservice \
+            inventoryservice
+          do
+            if kubectl get service "$SERVICE" \
+              -n "$K8S_NAMESPACE" \
+              > /dev/null 2>&1
+            then
+              echo "$SERVICE service available"
+            else
+              echo "$SERVICE service missing"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Checkout Service dependency validation failed"
+            exit 1
+          fi
+
+          echo "Checkout Service dependencies verified"
+
+
+      # ======================================================
+      # VERIFY HELM IS NOT ALREADY BUSY
+      # ======================================================
+
+      - name: Check Helm release state
+        run: |
+          HELM_STATUS="$(helm status "$HELM_RELEASE" \
+            -n "$K8S_NAMESPACE" \
+            -o json \
+            2>/dev/null \
+            | jq -r '.info.status // "not-installed"' \
+            || echo "not-installed")"
+
+          echo "Current Helm status: $HELM_STATUS"
+
+          case "$HELM_STATUS" in
+            pending-install|pending-upgrade|pending-rollback)
+              echo "Helm release has an unfinished operation"
+              exit 1
+              ;;
+          esac
+
+
+      # ======================================================
+      # DEPLOY CHECKOUT SERVICE
+      # ======================================================
+      # helm upgrade --install means:
+      #
+      # Existing release -> upgrade
+      # Missing release  -> install
+      #
+      # --atomic:
+      # Automatically rolls back if deployment fails.
+      #
+      # --wait:
+      # Waits for Kubernetes resources to become ready.
+      # ======================================================
+
+      - name: Deploy Checkout Service with Helm
+        run: |
+          PREVIOUS_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            2>/dev/null || true)"
+
+          echo "Previous image: ${PREVIOUS_IMAGE:-none}"
+          echo "New image     : $IMAGE_URI"
+
+          if helm upgrade \
+            --install \
+            "$HELM_RELEASE" \
+            "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            --atomic \
+            --cleanup-on-fail \
+            --history-max 5 \
+            --wait \
+            --timeout 5m \
+            > /tmp/helm-deploy.log 2>&1
+          then
+            echo "Checkout Service Helm deployment completed"
+          else
+            echo "Checkout Service Helm deployment failed"
+
+            tail -n 100 /tmp/helm-deploy.log
+
+            echo "Checkout Service pods:"
+
+            kubectl get pods \
+              -n "$K8S_NAMESPACE" \
+              -l app="$SERVICE_NAME" \
+              -o wide \
+              || true
+
+            exit 1
+          fi
+
+
+      # ======================================================
+      # VERIFY KUBERNETES ROLLOUT
+      # ======================================================
+
+      - name: Validate Kubernetes rollout
+        run: |
+          if kubectl rollout status \
+            deployment/"$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s \
+            > /tmp/rollout.log 2>&1
+          then
+            echo "Checkout Service rollout completed"
+          else
+            echo "Checkout Service rollout failed"
+
+            tail -n 80 /tmp/rollout.log
+
+            kubectl get pods \
+              -n "$K8S_NAMESPACE" \
+              -l app="$SERVICE_NAME" \
+              -o wide \
+              || true
+
+            exit 1
+          fi
+
+
+      # ======================================================
+      # VERIFY IMAGE AND READY REPLICAS
+      # ======================================================
+
+      - name: Validate deployed image and replicas
+        run: |
+          DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')"
+
+          DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')"
+
+          if [ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]; then
+            echo "Expected image: $IMAGE_URI"
+            echo "Running image : $DEPLOYED_IMAGE"
+            exit 1
+          fi
+
+          if [ "${READY:-0}" != "$DESIRED" ]; then
+            echo "Ready replicas: ${READY:-0}/${DESIRED}"
+            exit 1
+          fi
+
+          echo "Image verified: $DEPLOYED_IMAGE"
+          echo "Ready replicas: $READY/$DESIRED"
+
+
+      # ======================================================
+      # VERIFY CHECKOUT SERVICE HEALTH
+      # ======================================================
+      # We create a temporary curl pod inside Kubernetes.
+      #
+      # That pod calls:
+      #
+      # http://checkoutservice:8086/actuator/health
+      #
+      # Expected result:
+      # {"status":"UP"}
+      # ======================================================
+
+      - name: Validate Checkout Service health
+        run: |
+          ENDPOINTS="$(kubectl get endpointslice \
+            -n "$K8S_NAMESPACE" \
+            -l kubernetes.io/service-name="$K8S_SERVICE" \
+            -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" "}{end}')"
+
+          if [ -z "$ENDPOINTS" ]; then
+            echo "Checkout Service has no ready endpoints"
+            exit 1
+          fi
+
+          TEST_POD="checkoutservice-health-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            kubectl delete pod "$TEST_POD" \
+              -n "$K8S_NAMESPACE" \
+              --ignore-not-found \
+              > /dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          kubectl run "$TEST_POD" \
+            -n "$K8S_NAMESPACE" \
+            --restart=Never \
+            --image=curlimages/curl \
+            --command -- \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-delay 3 \
+              "http://${K8S_SERVICE}:${SERVICE_PORT}/actuator/health" \
+            > /dev/null
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            pod/"$TEST_POD" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=90s \
+            > /dev/null
+
+          HEALTH="$(kubectl logs "$TEST_POD" \
+            -n "$K8S_NAMESPACE")"
+
+          if echo "$HEALTH" | grep -q '"status":"UP"'
+          then
+            echo "Checkout Service health: UP"
+          else
+            echo "Checkout Service health check failed"
+            echo "$HEALTH"
+            exit 1
+          fi
+
+
+      # ======================================================
+      # FINAL DEPLOYMENT SUMMARY
+      # ======================================================
+
+      - name: Deployment summary
+        run: |
+          HELM_REVISION="$(helm history "$HELM_RELEASE" \
+            -n "$K8S_NAMESPACE" \
+            -o json \
+            | jq -r '.[-1].revision')"
+
+          echo "----------------------------------------"
+          echo "Checkout Service deployment completed"
+          echo "Version        : $APP_VERSION"
+          echo "Nexus artifact : $JAR_NAME"
+          echo "ECR image      : $IMAGE_URI"
+          echo "ECR digest     : $IMAGE_DIGEST"
+          echo "Helm release   : $HELM_RELEASE"
+          echo "Helm revision  : $HELM_REVISION"
+          echo "Deployment     : $K8S_DEPLOYMENT"
+          echo "Health         : UP"
+          echo "----------------------------------------"
